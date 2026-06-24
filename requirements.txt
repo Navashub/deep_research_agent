@@ -1,0 +1,12 @@
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-tavily>=0.1.0
+gradio>=4.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+pydantic>=2.0.0
+
+# pick whichever provider(s) you'll actually use via LLM_PROVIDER
+langchain-groq>=0.2.0
+langchain-ollama>=0.2.0
+langchain-openai>=0.2.0
