@@ -26,7 +26,7 @@ def get_llm(temperature: float = 0.5):
     if provider == "ollama":
         from langchain_ollama import ChatOllama
 
-        model = os.environ.get("OLLAMA_MODEL", "llama3.1")
+        model = os.environ.get("OLLAMA_MODEL", "llama3.2:latest")
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         return ChatOllama(model=model, base_url=base_url, temperature=temperature)
 
