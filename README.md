@@ -1,8 +1,63 @@
-# Audi Deep Research Agent — LangGraph version
+# Audi Deep Research Agent - LangGraph Edition
 
-This is a LangGraph/LangChain rewrite of your original OpenAI Agents SDK project.
-Same end result (Gradio app that researches Audi and writes a long blog post),
-different framework under the hood.
+A LangGraph/LangChain agent that takes a topic ("Audi quattro racing history"),
+researches it on the web, and writes a 2000-3000 word blog post about it.
+Originally built on OpenAI's Agents SDK; this version is a genuine LangGraph
+rewrite so the architecture actually matches what's on the CV.
+
+## What's actually happening when you click "Run"
+
+```
+                         ┌──────────────────┐
+   user query  ───────►  │   plan_searches   │   1 LLM call, structured output
+                         └─────────┬─────────┘   → WebSearchPlan (10 WebSearchItems)
+                                   │
+                    Send() fans out to N parallel branches
+                                   │
+              ┌────────────────────┼────────────────────┐
+              ▼                    ▼                    ▼
+        ┌──────────┐         ┌──────────┐         ┌──────────┐
+        │  search  │   ...   │  search  │   ...   │  search  │   one branch per item,
+        └────┬─────┘         └────┬─────┘         └────┬─────┘   runs concurrently
+             │                    │                    │
+       Tavily search +      Tavily search +      Tavily search +
+       LLM summarize        LLM summarize        LLM summarize
+              │                    │                    │
+              └────────────────────┼────────────────────┘
+                                   ▼
+                          (LangGraph waits for
+                           every branch to finish)
+                                   │
+                         ┌──────────────────┐
+                         │   write_report    │   1 LLM call, structured output
+                         └─────────┬─────────┘   → ReportData
+                                   │
+                         ┌──────────────────┐
+                         │    send_push      │   optional, skipped if unconfigured
+                         └─────────┬─────────┘
+                                   ▼
+                           markdown report
+                          streamed to Gradio
+```
+
+This whole flow is defined declaratively in `graph.py` as a LangGraph
+`StateGraph`. The interesting part is `continue_to_searches()` - it uses
+LangGraph's `Send` API to dynamically create one parallel branch per planned
+search, which is the graph-native replacement for manually managing
+`asyncio.create_task` calls.
+
+## File-by-file
+
+| File | Role |
+|---|---|
+| `app.py` | Gradio UI. Streams status updates and the final report via `graph.astream(...)`. |
+| `graph.py` | Defines the `StateGraph`: nodes, edges, and the parallel fan-out logic. This is the orchestration layer - the LangGraph equivalent of a manually-written controller. |
+| `llm_config.py` | One function, `get_llm()`, that returns a chat model based on the `LLM_PROVIDER` env var (`groq` / `ollama` / `openai`). Every other file calls this instead of importing a specific provider's SDK, so swapping models never touches business logic. |
+| `planner_agent.py` | Turns the user's query into a `WebSearchPlan` (10 `WebSearchItem`s) via structured output. |
+| `search_agent.py` | For each planned item: calls Tavily, then has the LLM turn the raw search snippets into a clean 400-500 word summary. |
+| `writer_agent.py` | Takes all the search summaries and writes the final `ReportData` (short summary, full markdown report, follow-up questions). |
+| `push_agent.py` | Optional Pushover notification once the report's ready. No-ops quietly if `PUSHOVER_USER`/`PUSHOVER_TOKEN` aren't set. |
+| `test_setup.py` | Smoke test - confirms your provider, structured output, and Tavily all work *before* you run a full (slow) end-to-end pass. |
 
 ## Setup
 
@@ -11,84 +66,105 @@ pip install -r requirements.txt
 cp .env.example .env   # then fill in your real keys
 ```
 
-### Choosing your LLM provider
+Pick a provider in `.env` via `LLM_PROVIDER`:
 
-Set `LLM_PROVIDER` in `.env` to one of:
+- **`groq`** - hosted Llama (`llama-3.3-70b-versatile`), fast, free tier, no GPU needed
+- **`ollama`** - fully local (e.g. `llama3.2:latest`), needs `ollama serve` running and the model pulled
+- **`openai`** - original fallback
 
-- **`groq`** (default) — hosted Llama models (e.g. `llama-3.3-70b-versatile`), runs in
-  the cloud but is extremely fast and has a free tier. This is the easiest way to use
-  Llama without needing a GPU. Get a key at https://console.groq.com/keys
-- **`ollama`** — truly local. Install https://ollama.com, run `ollama pull llama3.1`,
-  then point `OLLAMA_BASE_URL` at your local server (default `http://localhost:11434`).
-  No API key needed, but you need decent hardware and it'll be slower than Groq.
-- **`openai`** — the original provider, kept as a fallback.
+You always need `TAVILY_API_KEY` regardless of provider - that's the web search step.
 
-This switch lives in `llm_config.py` and is used by `planner_agent.py`,
-`search_agent.py`, and `writer_agent.py` — none of them import a specific
-provider's SDK directly anymore, they just call `get_llm()`.
-
-One thing to flag: structured output (`with_structured_output`) relies on tool
-calling, which not every local model handles well. `llama3.1` and newer (and most
-Groq-hosted Llama models) support it fine. If you try an older/smaller Ollama model
-and get parsing errors, that's almost always why.
-
-You also always need:
-- `TAVILY_API_KEY` — free key at https://tavily.com, used for web search regardless of LLM provider
-- `PUSHOVER_USER` / `PUSHOVER_TOKEN` — optional, only if you want the push
-  notification step to actually send something (it's skipped quietly if unset)
+**Important:** `load_dotenv()` must run before anything that imports `graph.py`,
+`planner_agent.py`, etc., because those modules call `get_llm()` at import
+time. `app.py` is already ordered correctly - keep it that way if you touch it.
 
 ## Run
 
 ```bash
-python app.py
+python test_setup.py   # fast sanity check: provider, structured output, Tavily
+python app.py           # full Gradio app
 ```
 
-Opens a Gradio app in your browser, same as the original.
+---
 
-## How it maps to the original project
+## This is a working prototype, not a production system yet
 
-| Original (OpenAI Agents SDK)              | This version (LangGraph)                          |
-|--------------------------------------------|-----------------------------------------------------|
-| `planner_agent.py` → `Agent` with `output_type` | `planner_agent.py` → `ChatOpenAI.with_structured_output()` |
-| `search_agent.py` → `Agent` + hosted `WebSearchTool` | `search_agent.py` → `TavilySearch` tool + LLM summarizer |
-| `writer_agent.py` → `Agent` with `output_type` | `writer_agent.py` → `ChatOpenAI.with_structured_output()` |
-| `push_agent.py` → `Agent` + `@function_tool` | `push_agent.py` → `@tool` from `langchain_core.tools` |
-| `research_manager.py` → manual `asyncio` orchestration | `graph.py` → a `StateGraph` with `Send` for fan-out |
-| `deep_research.py` → Gradio UI | `app.py` → Gradio UI, streaming via `graph.astream(...)` |
+It's solid for demoing the architecture and talking through the design in an
+interview, but there's a real gap to "production." Roughly in priority order:
 
-## The key architectural difference
+### Reliability
+- **No retries.** A single failed Tavily call or a flaky local-model parse
+  failure just silently drops that one search result (`search_one` catches
+  the exception and returns `None`). Fine for a demo, not for anything
+  someone depends on. Add retry logic (e.g. `tenacity`) around both the
+  Tavily call and the structured-output calls.
+- **No timeout handling.** A hung Ollama call or slow Tavily request has
+  nothing bounding it. Add per-call timeouts.
+- **Structured output on small local models is inherently flaky.**
+  `llama3.2` can occasionally return malformed JSON, especially on the
+  writer step (long free-text field + a list, in one schema). Worth adding
+  a fallback: catch the parsing error and retry once with a simpler prompt,
+  or split the writer call into two smaller structured calls.
 
-The original manually wires async tasks together in `research_manager.py`
-(`asyncio.create_task` + `asyncio.as_completed`). LangGraph replaces that with
-an explicit graph:
+### Observability
+- **No tracing.** The original OpenAI Agents SDK version had a built-in
+  trace URL; this version has none. LangSmith (`langchain` integrates with
+  it natively - just set `LANGCHAIN_TRACING_V2=true` and the right env vars)
+  would give you per-node latency, token usage, and full input/output
+  visibility for free.
+- **`print()` statements instead of real logging.** Swap for the `logging`
+  module with proper levels, so you can dial verbosity up/down without
+  editing code.
 
-```
-START -> plan_searches -> [search, search, search, ...] (parallel, fanned out via Send) -> write_report -> send_push -> END
-```
+### Testing
+- **Zero automated tests.** `test_setup.py` is a manual smoke test, not a
+  test suite. Worth adding actual unit tests for each node function with
+  mocked LLM/Tavily responses, plus at least one integration test that runs
+  the full graph against a cheap/fast model.
 
-`continue_to_searches()` in `graph.py` is the part doing the fan-out — it
-returns one `Send("search", ...)` per planned query, and LangGraph runs them
-concurrently, waiting for all of them before moving on to `write_report`.
-That's the direct equivalent of the original's parallel search loop.
+### Architecture / scalability
+- **Everything runs synchronously inside one Gradio process.** Fine for one
+  person testing locally; won't hold up under concurrent users. A real
+  deployment would put this behind a proper async API (FastAPI) with a task
+  queue, and have the Gradio/web frontend just poll or subscribe for status.
+- **No caching.** Re-running the same query re-does all 10 searches and all
+  LLM calls from scratch. Even a simple cache keyed on the search query
+  would cut cost and latency a lot for repeated topics.
+- **No persistence/checkpointing.** If the process crashes mid-run, the
+  entire state is lost. LangGraph supports a `checkpointer` (e.g.
+  `MemorySaver`, or a SQLite/Postgres-backed one) that would let you resume
+  a run instead of starting over - also opens the door to a "show me
+  progress so far" UI.
+- **Local model concurrency.** If you deploy with `LLM_PROVIDER=ollama`,
+  note that a single local Ollama server typically can't usefully serve many
+  concurrent requests - the 10 parallel "search" branches in this graph will
+  effectively queue up behind each other on one GPU/CPU. This isn't a problem
+  with Groq (or OpenAI), since those are properly multi-tenant hosted
+  services. Worth being explicit about this trade-off if asked in an
+  interview: local = private/free but serializes under load; hosted = scales
+  but costs money and leaves your machine.
 
-## Why Tavily instead of OpenAI's WebSearchTool
+### Security / config hygiene
+- **No secrets management.** `.env` is fine for local dev, but a production
+  deploy should pull keys from a proper secrets manager (AWS Secrets Manager,
+  GCP Secret Manager, Vault, etc.), not a flat file.
+- **No input validation/guardrails on the user's query.** Nothing stops
+  someone from typing something wildly off-topic or adversarial and burning
+  10 searches + 2 LLM calls on it. A cheap guard (keyword check or a fast
+  classifier) before `plan_searches` would help.
+- **No rate limiting.** Nothing stops one user from spamming the Gradio
+  button and running up your Tavily/Groq bill.
 
-The original used OpenAI's *hosted* search tool, which only exists inside
-the OpenAI Agents SDK / Responses API — LangChain has no equivalent for it.
-Tavily is the standard search tool in the LangGraph ecosystem and is what
-most LangGraph tutorials and docs use, so it's a reasonable thing to have on
-your CV alongside "built an agent with LangGraph."
+### Product polish
+- **Streaming is step-level, not token-level.** Right now `app.py` only
+  yields a new message when an entire node finishes (e.g. "writing
+  report..." then the whole report appears at once). True token-by-token
+  streaming of the final report would feel much more responsive - LangGraph
+  supports `stream_mode="messages"` for this.
+- **No way to see the intermediate search results**, only the final report.
+  Even just logging/showing the 10 summaries would make debugging bad
+  reports much easier.
 
-## What's identical to the original
-
-- All the prompt instructions (planner, search summarizer, writer) — copied verbatim
-- The `WebSearchPlan` / `WebSearchItem` / `ReportData` schemas
-- The Pushover push notification logic
-- The Gradio UI layout and behavior
-
-## Things worth exploring next, if you want to go deeper for interview purposes
-
-- Swap `with_structured_output` for explicit tool-calling to talk about LangChain's tool-binding patterns
-- Add a `checkpointer` (e.g. `MemorySaver`) to demonstrate LangGraph's persistence/resumability
-- Add a conditional edge that retries a failed search instead of just dropping it
-- Visualize the graph with `pip install grandalf` then `research_graph.get_graph().draw_ascii()`
+None of this needs to happen at once - the architecture (clean node
+separation, provider abstraction, parallel fan-out) is already structured in
+a way that makes most of these additive rather than requiring a rewrite.
